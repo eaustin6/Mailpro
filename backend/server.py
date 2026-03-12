@@ -1,4 +1,5 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, APIRouter, HTTPException, Request, BackgroundTasks, Depends, Header
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -16,6 +17,8 @@ import hashlib
 import secrets
 import json
 import base64
+import random
+import string
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -38,24 +41,47 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Admin password from environment
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'ghostmail_admin_2024')
+
 # ==================== MODELS ====================
 
 class ConfigModel(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     resend_api_key: Optional[str] = None
     telegram_bot_token: Optional[str] = None
-    email_domain: str = "resend.dev"
+    email_domains: List[dict] = Field(default_factory=lambda: [{"domain": "resend.dev", "provider": "resend", "is_default": True}])
     webhook_secret: str = Field(default_factory=lambda: secrets.token_urlsafe(32))
-    default_expiration_hours: Optional[int] = None  # None = no expiration
+    default_expiration_hours: Optional[int] = None
+    # Authorization settings
+    website_auth_enabled: bool = False
+    telegram_auth_enabled: bool = False
+    authorized_telegram_users: List[int] = []  # List of authorized chat_ids
+    # Cloudflare settings
+    cloudflare_api_token: Optional[str] = None
+    cloudflare_account_id: Optional[str] = None
+    cloudflare_zone_ids: List[dict] = []  # [{zone_id, domain}]
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class ConfigUpdate(BaseModel):
     resend_api_key: Optional[str] = None
     telegram_bot_token: Optional[str] = None
-    email_domain: Optional[str] = None
+    email_domains: Optional[List[dict]] = None
     webhook_secret: Optional[str] = None
     default_expiration_hours: Optional[int] = None
+    website_auth_enabled: Optional[bool] = None
+    telegram_auth_enabled: Optional[bool] = None
+    authorized_telegram_users: Optional[List[int]] = None
+    cloudflare_api_token: Optional[str] = None
+    cloudflare_account_id: Optional[str] = None
+    cloudflare_zone_ids: Optional[List[dict]] = None
+
+class DomainAdd(BaseModel):
+    domain: str
+    provider: str = "resend"  # resend or cloudflare
+    is_default: bool = False
+    cloudflare_zone_id: Optional[str] = None
 
 class TempEmail(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -70,6 +96,7 @@ class TempEmailCreate(BaseModel):
     custom_prefix: Optional[str] = None
     expiration_hours: Optional[int] = None
     telegram_chat_id: Optional[int] = None
+    domain: Optional[str] = None
 
 class InboxEmail(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -97,7 +124,87 @@ class TelegramUser(BaseModel):
     username: Optional[str] = None
     first_name: Optional[str] = None
     current_email_id: Optional[str] = None
+    is_authorized: bool = False
     registered_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class WebSession(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    telegram_chat_id: int
+    telegram_username: str
+    otp_code: str
+    otp_expires_at: datetime
+    is_verified: bool = False
+    session_token: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class LoginRequest(BaseModel):
+    telegram_username: str
+
+class VerifyOTPRequest(BaseModel):
+    telegram_username: str
+    otp_code: str
+
+class AdminLoginRequest(BaseModel):
+    password: str
+
+# ==================== AUTH HELPERS ====================
+
+def verify_admin_password(password: str) -> bool:
+    """Verify admin password"""
+    return password == ADMIN_PASSWORD
+
+async def verify_admin_token(authorization: Optional[str] = Header(None)):
+    """Verify admin authorization header"""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization required")
+    
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    
+    token = authorization[7:]
+    
+    # Check if it's a valid admin session
+    session = await db.admin_sessions.find_one({"token": token, "is_valid": True}, {"_id": 0})
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    
+    # Check expiration
+    expires_at = datetime.fromisoformat(session['expires_at']) if isinstance(session['expires_at'], str) else session['expires_at']
+    if datetime.now(timezone.utc) > expires_at.replace(tzinfo=timezone.utc):
+        await db.admin_sessions.update_one({"token": token}, {"$set": {"is_valid": False}})
+        raise HTTPException(status_code=401, detail="Session expired")
+    
+    return True
+
+async def verify_user_session(authorization: Optional[str] = Header(None)):
+    """Verify user session token"""
+    config = await get_config()
+    
+    # If website auth is disabled, allow access
+    if not config.get('website_auth_enabled', False):
+        return None
+    
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization required")
+    
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    
+    token = authorization[7:]
+    
+    session = await db.web_sessions.find_one({"session_token": token, "is_verified": True}, {"_id": 0})
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    
+    return session
+
+def generate_otp():
+    """Generate 6-digit OTP"""
+    return ''.join(random.choices(string.digits, k=6))
+
+def generate_session_token():
+    """Generate secure session token"""
+    return secrets.token_urlsafe(32)
 
 # ==================== HELPER FUNCTIONS ====================
 
@@ -121,6 +228,15 @@ def generate_email_prefix():
     import random
     return f"{random.choice(adjectives)}{random.choice(nouns)}{random.randint(100, 999)}"
 
+async def get_default_domain():
+    """Get default email domain"""
+    config = await get_config()
+    domains = config.get('email_domains', [])
+    for d in domains:
+        if d.get('is_default'):
+            return d.get('domain', 'resend.dev')
+    return domains[0].get('domain', 'resend.dev') if domains else 'resend.dev'
+
 async def send_telegram_message(chat_id: int, text: str, parse_mode: str = "HTML"):
     """Send message to Telegram user"""
     config = await get_config()
@@ -130,8 +246,8 @@ async def send_telegram_message(chat_id: int, text: str, parse_mode: str = "HTML
         return False
     
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
+        async with httpx.AsyncClient() as http_client:
+            response = await http_client.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
                 json={
                     "chat_id": chat_id,
@@ -152,10 +268,10 @@ async def send_telegram_document(chat_id: int, file_content: bytes, filename: st
         return False
     
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient() as http_client:
             files = {"document": (filename, file_content)}
             data = {"chat_id": chat_id, "caption": caption}
-            response = await client.post(
+            response = await http_client.post(
                 f"https://api.telegram.org/bot{token}/sendDocument",
                 files=files,
                 data=data
@@ -173,7 +289,6 @@ async def forward_email_to_telegram(inbox_email: dict):
     
     chat_id = temp_email['telegram_chat_id']
     
-    # Format message
     message = f"""📬 <b>NEW EMAIL RECEIVED</b>
 
 <b>From:</b> {inbox_email.get('from_name', '')} &lt;{inbox_email['from_address']}&gt;
@@ -186,7 +301,6 @@ async def forward_email_to_telegram(inbox_email: dict):
     
     await send_telegram_message(chat_id, message)
     
-    # Send attachments
     for attachment in inbox_email.get('attachments', []):
         if attachment.get('content'):
             try:
@@ -200,27 +314,191 @@ async def forward_email_to_telegram(inbox_email: dict):
             except Exception as e:
                 logger.error(f"Failed to send attachment: {e}")
     
-    # Mark as forwarded
     await db.inbox.update_one(
         {"id": inbox_email['id']},
         {"$set": {"forwarded_to_telegram": True}}
     )
 
+async def is_telegram_user_authorized(chat_id: int) -> bool:
+    """Check if telegram user is authorized"""
+    config = await get_config()
+    
+    if not config.get('telegram_auth_enabled', False):
+        return True
+    
+    authorized_users = config.get('authorized_telegram_users', [])
+    return chat_id in authorized_users
+
+# ==================== ADMIN AUTH ENDPOINTS ====================
+
+@api_router.post("/admin/login")
+async def admin_login(request: AdminLoginRequest):
+    """Admin login endpoint"""
+    if not verify_admin_password(request.password):
+        raise HTTPException(status_code=401, detail="Invalid password")
+    
+    token = generate_session_token()
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+    
+    session_doc = {
+        "token": token,
+        "is_valid": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "expires_at": expires_at.isoformat()
+    }
+    await db.admin_sessions.insert_one(session_doc)
+    
+    return {
+        "status": "success",
+        "token": token,
+        "expires_at": expires_at.isoformat()
+    }
+
+@api_router.post("/admin/logout")
+async def admin_logout(authorized: bool = Depends(verify_admin_token)):
+    """Admin logout endpoint"""
+    return {"status": "success", "message": "Logged out"}
+
+@api_router.get("/admin/verify")
+async def verify_admin(authorized: bool = Depends(verify_admin_token)):
+    """Verify admin session"""
+    return {"status": "success", "authenticated": True}
+
+# ==================== USER AUTH ENDPOINTS ====================
+
+@api_router.post("/auth/request-otp")
+async def request_otp(request: LoginRequest):
+    """Request OTP for website login"""
+    config = await get_config()
+    
+    if not config.get('website_auth_enabled', False):
+        return {"status": "success", "message": "Authentication disabled", "auth_disabled": True}
+    
+    telegram_username = request.telegram_username.lower().replace("@", "")
+    
+    user = await db.telegram_users.find_one({"username": telegram_username}, {"_id": 0})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found. Please start the Telegram bot first with /start")
+    
+    otp = generate_otp()
+    otp_expires = datetime.now(timezone.utc) + timedelta(minutes=5)
+    
+    session_doc = {
+        "id": str(uuid.uuid4()),
+        "telegram_chat_id": user['chat_id'],
+        "telegram_username": telegram_username,
+        "otp_code": otp,
+        "otp_expires_at": otp_expires.isoformat(),
+        "is_verified": False,
+        "session_token": None,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    
+    await db.web_sessions.delete_many({"telegram_username": telegram_username, "is_verified": False})
+    await db.web_sessions.insert_one(session_doc)
+    
+    otp_message = f"""🔐 <b>LOGIN VERIFICATION</b>
+
+Your OTP code for GhostMail website login:
+
+<code>{otp}</code>
+
+⏰ This code expires in 5 minutes.
+
+⚠️ Do not share this code with anyone."""
+    
+    sent = await send_telegram_message(user['chat_id'], otp_message)
+    if not sent:
+        raise HTTPException(status_code=500, detail="Failed to send OTP. Check bot configuration.")
+    
+    return {"status": "success", "message": "OTP sent to your Telegram"}
+
+@api_router.post("/auth/verify-otp")
+async def verify_otp(request: VerifyOTPRequest):
+    """Verify OTP and create session"""
+    config = await get_config()
+    
+    if not config.get('website_auth_enabled', False):
+        return {"status": "success", "message": "Authentication disabled", "auth_disabled": True}
+    
+    telegram_username = request.telegram_username.lower().replace("@", "")
+    
+    session = await db.web_sessions.find_one({
+        "telegram_username": telegram_username,
+        "otp_code": request.otp_code,
+        "is_verified": False
+    }, {"_id": 0})
+    
+    if not session:
+        raise HTTPException(status_code=400, detail="Invalid OTP code")
+    
+    otp_expires = datetime.fromisoformat(session['otp_expires_at'])
+    if datetime.now(timezone.utc) > otp_expires.replace(tzinfo=timezone.utc):
+        raise HTTPException(status_code=400, detail="OTP has expired")
+    
+    session_token = generate_session_token()
+    
+    await db.web_sessions.update_one(
+        {"id": session['id']},
+        {"$set": {"is_verified": True, "session_token": session_token}}
+    )
+    
+    user = await db.telegram_users.find_one({"username": telegram_username}, {"_id": 0})
+    
+    return {
+        "status": "success",
+        "token": session_token,
+        "user": {
+            "username": telegram_username,
+            "chat_id": session['telegram_chat_id'],
+            "first_name": user.get('first_name', '') if user else ''
+        }
+    }
+
+@api_router.get("/auth/status")
+async def auth_status():
+    """Get authentication status"""
+    config = await get_config()
+    return {
+        "website_auth_enabled": config.get('website_auth_enabled', False),
+        "telegram_auth_enabled": config.get('telegram_auth_enabled', False)
+    }
+
+@api_router.get("/auth/me")
+async def get_current_user(session = Depends(verify_user_session)):
+    """Get current logged in user"""
+    if session is None:
+        return {"authenticated": False, "auth_disabled": True}
+    
+    return {
+        "authenticated": True,
+        "user": {
+            "username": session.get('telegram_username'),
+            "chat_id": session.get('telegram_chat_id')
+        }
+    }
+
 # ==================== CONFIG ENDPOINTS ====================
 
 @api_router.get("/admin/config")
-async def get_admin_config():
+async def get_admin_config(authorized: bool = Depends(verify_admin_token)):
     """Get current configuration (masks sensitive data)"""
     config = await get_config()
-    # Mask sensitive data
+    
     if config.get('resend_api_key'):
-        config['resend_api_key'] = f"{config['resend_api_key'][:10]}...{config['resend_api_key'][-4:]}"
+        key = config['resend_api_key']
+        config['resend_api_key'] = f"{key[:10]}...{key[-4:]}" if len(key) > 14 else "***"
     if config.get('telegram_bot_token'):
-        config['telegram_bot_token'] = f"{config['telegram_bot_token'][:10]}...{config['telegram_bot_token'][-4:]}"
+        token = config['telegram_bot_token']
+        config['telegram_bot_token'] = f"{token[:10]}...{token[-4:]}" if len(token) > 14 else "***"
+    if config.get('cloudflare_api_token'):
+        token = config['cloudflare_api_token']
+        config['cloudflare_api_token'] = f"{token[:10]}...{token[-4:]}" if len(token) > 14 else "***"
+    
     return config
 
 @api_router.put("/admin/config")
-async def update_admin_config(update: ConfigUpdate):
+async def update_admin_config(update: ConfigUpdate, authorized: bool = Depends(verify_admin_token)):
     """Update configuration"""
     config = await get_config()
     update_dict = {k: v for k, v in update.model_dump().items() if v is not None}
@@ -231,11 +509,90 @@ async def update_admin_config(update: ConfigUpdate):
         {"$set": update_dict}
     )
     
-    # If telegram bot token changed, set webhook
     if update.telegram_bot_token:
         await setup_telegram_webhook(update.telegram_bot_token, config.get('webhook_secret', ''))
     
     return {"status": "success", "message": "Configuration updated"}
+
+@api_router.post("/admin/domains")
+async def add_domain(domain_data: DomainAdd, authorized: bool = Depends(verify_admin_token)):
+    """Add a new email domain"""
+    config = await get_config()
+    domains = config.get('email_domains', [])
+    
+    for d in domains:
+        if d.get('domain') == domain_data.domain:
+            raise HTTPException(status_code=400, detail="Domain already exists")
+    
+    if domain_data.is_default:
+        for d in domains:
+            d['is_default'] = False
+    
+    new_domain = {
+        "domain": domain_data.domain,
+        "provider": domain_data.provider,
+        "is_default": domain_data.is_default,
+        "cloudflare_zone_id": domain_data.cloudflare_zone_id,
+        "added_at": datetime.now(timezone.utc).isoformat()
+    }
+    domains.append(new_domain)
+    
+    await db.config.update_one(
+        {"id": config['id']},
+        {"$set": {"email_domains": domains, "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    
+    return {"status": "success", "message": "Domain added", "domains": domains}
+
+@api_router.delete("/admin/domains/{domain}")
+async def remove_domain(domain: str, authorized: bool = Depends(verify_admin_token)):
+    """Remove an email domain"""
+    config = await get_config()
+    domains = config.get('email_domains', [])
+    
+    domains = [d for d in domains if d.get('domain') != domain]
+    
+    if not domains:
+        domains = [{"domain": "resend.dev", "provider": "resend", "is_default": True}]
+    elif not any(d.get('is_default') for d in domains):
+        domains[0]['is_default'] = True
+    
+    await db.config.update_one(
+        {"id": config['id']},
+        {"$set": {"email_domains": domains, "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    
+    return {"status": "success", "message": "Domain removed", "domains": domains}
+
+@api_router.post("/admin/authorize-telegram-user/{chat_id}")
+async def authorize_telegram_user(chat_id: int, authorized: bool = Depends(verify_admin_token)):
+    """Authorize a Telegram user"""
+    config = await get_config()
+    authorized_users = config.get('authorized_telegram_users', [])
+    
+    if chat_id not in authorized_users:
+        authorized_users.append(chat_id)
+        await db.config.update_one(
+            {"id": config['id']},
+            {"$set": {"authorized_telegram_users": authorized_users}}
+        )
+    
+    return {"status": "success", "message": f"User {chat_id} authorized"}
+
+@api_router.delete("/admin/authorize-telegram-user/{chat_id}")
+async def revoke_telegram_user(chat_id: int, authorized: bool = Depends(verify_admin_token)):
+    """Revoke Telegram user authorization"""
+    config = await get_config()
+    authorized_users = config.get('authorized_telegram_users', [])
+    
+    if chat_id in authorized_users:
+        authorized_users.remove(chat_id)
+        await db.config.update_one(
+            {"id": config['id']},
+            {"$set": {"authorized_telegram_users": authorized_users}}
+        )
+    
+    return {"status": "success", "message": f"User {chat_id} authorization revoked"}
 
 async def setup_telegram_webhook(token: str, webhook_secret: str):
     """Setup Telegram webhook"""
@@ -247,8 +604,8 @@ async def setup_telegram_webhook(token: str, webhook_secret: str):
     webhook_url = f"{backend_url}/api/webhook/telegram/{webhook_secret}"
     
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
+        async with httpx.AsyncClient() as http_client:
+            response = await http_client.post(
                 f"https://api.telegram.org/bot{token}/setWebhook",
                 json={"url": webhook_url}
             )
@@ -259,23 +616,20 @@ async def setup_telegram_webhook(token: str, webhook_secret: str):
 # ==================== EMAIL ENDPOINTS ====================
 
 @api_router.post("/email/generate")
-async def generate_temp_email(request: TempEmailCreate):
+async def generate_temp_email(request: TempEmailCreate, session = Depends(verify_user_session)):
     """Generate a new temporary email address"""
     config = await get_config()
     
     prefix = request.custom_prefix if request.custom_prefix else generate_email_prefix()
-    # Sanitize prefix
     prefix = ''.join(c for c in prefix.lower() if c.isalnum() or c in '-_')[:20]
     
-    domain = config.get('email_domain', 'resend.dev')
+    domain = request.domain if request.domain else await get_default_domain()
     email_address = f"{prefix}@{domain}"
     
-    # Check if email already exists
     existing = await db.temp_emails.find_one({"email_address": email_address, "is_active": True}, {"_id": 0})
     if existing:
         return {"status": "error", "message": "Email address already exists"}
     
-    # Calculate expiration
     expires_at = None
     expiration_hours = request.expiration_hours if request.expiration_hours is not None else config.get('default_expiration_hours')
     if expiration_hours:
@@ -291,7 +645,6 @@ async def generate_temp_email(request: TempEmailCreate):
     email_dict['created_at'] = email_dict['created_at'].isoformat()
     email_dict['expires_at'] = email_dict['expires_at'].isoformat() if email_dict['expires_at'] else None
     
-    # Store copy for insert (MongoDB mutates dict and adds _id)
     insert_doc = email_dict.copy()
     await db.temp_emails.insert_one(insert_doc)
     
@@ -301,7 +654,7 @@ async def generate_temp_email(request: TempEmailCreate):
     }
 
 @api_router.get("/email/list")
-async def list_temp_emails(telegram_chat_id: Optional[int] = None):
+async def list_temp_emails(telegram_chat_id: Optional[int] = None, session = Depends(verify_user_session)):
     """List all active temporary emails"""
     query = {"is_active": True}
     if telegram_chat_id:
@@ -310,8 +663,15 @@ async def list_temp_emails(telegram_chat_id: Optional[int] = None):
     emails = await db.temp_emails.find(query, {"_id": 0}).sort("created_at", -1).to_list(100)
     return {"emails": emails}
 
+@api_router.get("/email/domains")
+async def list_domains(session = Depends(verify_user_session)):
+    """List available email domains"""
+    config = await get_config()
+    domains = config.get('email_domains', [])
+    return {"domains": [d.get('domain') for d in domains]}
+
 @api_router.get("/email/inbox/{email_id}")
-async def get_inbox(email_id: str):
+async def get_inbox(email_id: str, session = Depends(verify_user_session)):
     """Get inbox for a temporary email"""
     temp_email = await db.temp_emails.find_one({"id": email_id}, {"_id": 0})
     if not temp_email:
@@ -325,19 +685,18 @@ async def get_inbox(email_id: str):
     return {"inbox": emails, "temp_email": temp_email}
 
 @api_router.get("/email/message/{message_id}")
-async def get_email_message(message_id: str):
+async def get_email_message(message_id: str, session = Depends(verify_user_session)):
     """Get a specific email message"""
     message = await db.inbox.find_one({"id": message_id}, {"_id": 0})
     if not message:
         raise HTTPException(status_code=404, detail="Message not found")
     
-    # Mark as read
     await db.inbox.update_one({"id": message_id}, {"$set": {"is_read": True}})
     
     return message
 
 @api_router.post("/email/send")
-async def send_email(request: SendEmailRequest):
+async def send_email(request: SendEmailRequest, session = Depends(verify_user_session)):
     """Send an email from a temporary address"""
     config = await get_config()
     
@@ -370,7 +729,7 @@ async def send_email(request: SendEmailRequest):
         raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
 
 @api_router.delete("/email/{email_id}")
-async def delete_temp_email(email_id: str):
+async def delete_temp_email(email_id: str, session = Depends(verify_user_session)):
     """Delete/deactivate a temporary email"""
     result = await db.temp_emails.update_one(
         {"id": email_id},
@@ -396,7 +755,6 @@ async def resend_webhook(request: Request, background_tasks: BackgroundTasks):
             
             to_address = data.get('to', [''])[0] if isinstance(data.get('to'), list) else data.get('to', '')
             
-            # Find the temp email
             temp_email = await db.temp_emails.find_one(
                 {"email_address": to_address, "is_active": True},
                 {"_id": 0}
@@ -406,7 +764,6 @@ async def resend_webhook(request: Request, background_tasks: BackgroundTasks):
                 logger.warning(f"No active temp email found for: {to_address}")
                 return {"status": "ignored", "reason": "No matching email"}
             
-            # Store the email
             inbox_email = InboxEmail(
                 temp_email_id=temp_email['id'],
                 to_address=to_address,
@@ -424,7 +781,6 @@ async def resend_webhook(request: Request, background_tasks: BackgroundTasks):
             insert_doc = email_dict.copy()
             await db.inbox.insert_one(insert_doc)
             
-            # Forward to Telegram in background
             background_tasks.add_task(forward_email_to_telegram, email_dict)
             
             return {"status": "success", "message_id": inbox_email.id}
@@ -432,6 +788,47 @@ async def resend_webhook(request: Request, background_tasks: BackgroundTasks):
         return {"status": "ok"}
     except Exception as e:
         logger.error(f"Webhook error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.post("/webhook/cloudflare")
+async def cloudflare_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Handle incoming emails from Cloudflare Email Routing"""
+    try:
+        payload = await request.json()
+        logger.info(f"Cloudflare webhook received")
+        
+        to_address = payload.get('to', '')
+        
+        temp_email = await db.temp_emails.find_one(
+            {"email_address": to_address, "is_active": True},
+            {"_id": 0}
+        )
+        
+        if not temp_email:
+            return {"status": "ignored", "reason": "No matching email"}
+        
+        inbox_email = InboxEmail(
+            temp_email_id=temp_email['id'],
+            to_address=to_address,
+            from_address=payload.get('from', ''),
+            from_name=payload.get('from_name', ''),
+            subject=payload.get('subject', 'No Subject'),
+            body_text=payload.get('text', ''),
+            body_html=payload.get('html', ''),
+            attachments=payload.get('attachments', [])
+        )
+        
+        email_dict = inbox_email.model_dump()
+        email_dict['received_at'] = email_dict['received_at'].isoformat()
+        
+        insert_doc = email_dict.copy()
+        await db.inbox.insert_one(insert_doc)
+        
+        background_tasks.add_task(forward_email_to_telegram, email_dict)
+        
+        return {"status": "success", "message_id": inbox_email.id}
+    except Exception as e:
+        logger.error(f"Cloudflare webhook error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.post("/webhook/telegram/{secret}")
@@ -455,9 +852,12 @@ async def telegram_webhook(secret: str, request: Request, background_tasks: Back
         username = message.get('from', {}).get('username', '')
         first_name = message.get('from', {}).get('first_name', '')
         
-        # Handle commands
         if text.startswith('/start'):
             await handle_start_command(chat_id, username, first_name)
+        elif text.startswith('/authorize'):
+            await handle_authorize_command(chat_id, text)
+        elif not await is_telegram_user_authorized(chat_id):
+            await send_telegram_message(chat_id, "⛔ You are not authorized to use this bot.\n\nContact the administrator to get access.")
         elif text.startswith('/generate'):
             await handle_generate_command(chat_id, text)
         elif text.startswith('/inbox'):
@@ -468,6 +868,8 @@ async def telegram_webhook(secret: str, request: Request, background_tasks: Back
             await handle_delete_command(chat_id, text)
         elif text.startswith('/send'):
             await handle_send_command(chat_id, text)
+        elif text.startswith('/myid'):
+            await handle_myid_command(chat_id, username)
         elif text.startswith('/help'):
             await handle_help_command(chat_id)
         
@@ -480,23 +882,35 @@ async def telegram_webhook(secret: str, request: Request, background_tasks: Back
 
 async def handle_start_command(chat_id: int, username: str, first_name: str):
     """Handle /start command"""
-    # Register or update user
     existing = await db.telegram_users.find_one({"chat_id": chat_id}, {"_id": 0})
     
     if not existing:
         user = TelegramUser(
             chat_id=chat_id,
-            username=username,
+            username=username.lower() if username else None,
             first_name=first_name
         )
         user_dict = user.model_dump()
         user_dict['registered_at'] = user_dict['registered_at'].isoformat()
         insert_doc = user_dict.copy()
         await db.telegram_users.insert_one(insert_doc)
+    else:
+        await db.telegram_users.update_one(
+            {"chat_id": chat_id},
+            {"$set": {"username": username.lower() if username else None, "first_name": first_name}}
+        )
+    
+    config = await get_config()
+    auth_status = "🔓 Open Access" if not config.get('telegram_auth_enabled') else "🔐 Authorization Required"
     
     welcome_message = f"""🔮 <b>WELCOME TO GHOSTMAIL</b>
 
 Hello {first_name}! I'm your secure temp email bot.
+
+<b>YOUR INFO:</b>
+📱 Chat ID: <code>{chat_id}</code>
+👤 Username: @{username if username else 'not set'}
+🔑 Status: {auth_status}
 
 <b>AVAILABLE COMMANDS:</b>
 /generate [prefix] - Create new temp email
@@ -504,11 +918,56 @@ Hello {first_name}! I'm your secure temp email bot.
 /inbox - Check inbox for your email
 /delete [email_id] - Delete a temp email
 /send - Send an email (guided)
+/myid - Get your ID for website login
 /help - Show this help
 
 🛡️ <i>Your privacy, our priority.</i>"""
     
     await send_telegram_message(chat_id, welcome_message)
+
+async def handle_authorize_command(chat_id: int, text: str):
+    """Handle /authorize command (admin only)"""
+    config = await get_config()
+    authorized_users = config.get('authorized_telegram_users', [])
+    
+    if authorized_users and chat_id not in authorized_users:
+        await send_telegram_message(chat_id, "⛔ Only administrators can use this command.")
+        return
+    
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        await send_telegram_message(chat_id, "Usage: /authorize [chat_id]")
+        return
+    
+    try:
+        target_chat_id = int(parts[1].strip())
+    except ValueError:
+        await send_telegram_message(chat_id, "❌ Invalid chat ID. Must be a number.")
+        return
+    
+    if target_chat_id not in authorized_users:
+        authorized_users.append(target_chat_id)
+        await db.config.update_one(
+            {"id": config['id']},
+            {"$set": {"authorized_telegram_users": authorized_users}}
+        )
+        await send_telegram_message(chat_id, f"✅ User {target_chat_id} has been authorized.")
+        await send_telegram_message(target_chat_id, "✅ You have been authorized to use GhostMail bot!")
+    else:
+        await send_telegram_message(chat_id, f"ℹ️ User {target_chat_id} is already authorized.")
+
+async def handle_myid_command(chat_id: int, username: str):
+    """Handle /myid command"""
+    message = f"""🆔 <b>YOUR IDENTITY</b>
+
+<b>Chat ID:</b> <code>{chat_id}</code>
+<b>Username:</b> @{username if username else 'not set'}
+
+<b>Website Login:</b>
+Use your username <code>@{username}</code> to login on the website.
+An OTP will be sent here for verification."""
+    
+    await send_telegram_message(chat_id, message)
 
 async def handle_generate_command(chat_id: int, text: str):
     """Handle /generate command"""
@@ -519,16 +978,14 @@ async def handle_generate_command(chat_id: int, text: str):
     prefix = custom_prefix if custom_prefix else generate_email_prefix()
     prefix = ''.join(c for c in prefix.lower() if c.isalnum() or c in '-_')[:20]
     
-    domain = config.get('email_domain', 'resend.dev')
+    domain = await get_default_domain()
     email_address = f"{prefix}@{domain}"
     
-    # Check if email already exists
     existing = await db.temp_emails.find_one({"email_address": email_address, "is_active": True}, {"_id": 0})
     if existing:
         await send_telegram_message(chat_id, "❌ Email already exists. Try a different prefix.")
         return
     
-    # Calculate expiration
     expires_at = None
     expiration_hours = config.get('default_expiration_hours')
     if expiration_hours:
@@ -547,7 +1004,6 @@ async def handle_generate_command(chat_id: int, text: str):
     insert_doc = email_dict.copy()
     await db.temp_emails.insert_one(insert_doc)
     
-    # Update user's current email
     await db.telegram_users.update_one(
         {"chat_id": chat_id},
         {"$set": {"current_email_id": email_dict['id']}}
@@ -567,11 +1023,9 @@ ID: <code>{email_dict['id'][:8]}...</code>{expiry_text}
 
 async def handle_inbox_command(chat_id: int):
     """Handle /inbox command"""
-    # Get user's current email
     user = await db.telegram_users.find_one({"chat_id": chat_id}, {"_id": 0})
     
     if not user or not user.get('current_email_id'):
-        # Get most recent email
         temp_email = await db.temp_emails.find_one(
             {"telegram_chat_id": chat_id, "is_active": True},
             {"_id": 0}
@@ -647,7 +1101,6 @@ async def handle_delete_command(chat_id: int, text: str):
     
     email_id_prefix = parts[1].strip()
     
-    # Find email by prefix
     email = await db.temp_emails.find_one(
         {
             "telegram_chat_id": chat_id,
@@ -670,7 +1123,6 @@ async def handle_delete_command(chat_id: int, text: str):
 
 async def handle_send_command(chat_id: int, text: str):
     """Handle /send command"""
-    # Parse: /send to@email.com | Subject | Body
     parts = text.split('|')
     
     if len(parts) < 3:
@@ -686,7 +1138,6 @@ Example:
     subject = parts[1].strip()
     body = parts[2].strip()
     
-    # Get user's current email
     user = await db.telegram_users.find_one({"chat_id": chat_id}, {"_id": 0})
     if not user or not user.get('current_email_id'):
         temp_email = await db.temp_emails.find_one(
@@ -744,6 +1195,10 @@ async def handle_help_command(chat_id: int):
 <b>📤 Sending:</b>
 /send to@email | Subject | Body
 
+<b>🔑 Authentication:</b>
+/myid - Get your ID for website login
+/authorize [chat_id] - Authorize a user (admin)
+
 <b>ℹ️ Info:</b>
 /help - Show this message
 
@@ -751,6 +1206,7 @@ async def handle_help_command(chat_id: int):
 • All received emails are auto-forwarded here
 • Attachments are sent as documents
 • Use custom prefix for memorable addresses
+• Use /myid to get login credentials for website
 
 🛡️ <i>Stay anonymous. Stay safe.</i>"""
     
@@ -759,7 +1215,7 @@ async def handle_help_command(chat_id: int):
 # ==================== STATS ENDPOINT ====================
 
 @api_router.get("/stats")
-async def get_stats():
+async def get_stats(session = Depends(verify_user_session)):
     """Get system statistics"""
     total_emails = await db.temp_emails.count_documents({"is_active": True})
     total_messages = await db.inbox.count_documents({})

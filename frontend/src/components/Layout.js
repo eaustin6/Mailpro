@@ -1,8 +1,51 @@
-import { Outlet, Link, useLocation } from "react-router-dom";
-import { Mail, Settings, Terminal, Ghost } from "lucide-react";
+import { useState, useEffect } from "react";
+import { Outlet, Link, useLocation, useNavigate } from "react-router-dom";
+import { Mail, Settings, Terminal, Ghost, LogOut, User } from "lucide-react";
+import { toast } from "sonner";
+import { getAuthStatus } from "../lib/api";
 
 const Layout = () => {
   const location = useLocation();
+  const navigate = useNavigate();
+  const [user, setUser] = useState(null);
+  const [authEnabled, setAuthEnabled] = useState(false);
+
+  useEffect(() => {
+    checkAuth();
+  }, [location.pathname]);
+
+  const checkAuth = async () => {
+    try {
+      const status = await getAuthStatus();
+      setAuthEnabled(status.website_auth_enabled);
+      
+      if (status.website_auth_enabled) {
+        const token = localStorage.getItem("user_token");
+        const userInfo = localStorage.getItem("user_info");
+        
+        if (!token && location.pathname !== "/admin") {
+          navigate("/login");
+          return;
+        }
+        
+        if (userInfo) {
+          setUser(JSON.parse(userInfo));
+        }
+      }
+    } catch (error) {
+      console.error("Auth check failed");
+    }
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem("user_token");
+    localStorage.removeItem("user_info");
+    setUser(null);
+    toast.success("Logged out successfully");
+    if (authEnabled) {
+      navigate("/login");
+    }
+  };
 
   const isActive = (path) => {
     if (path === '/') return location.pathname === '/';
@@ -57,6 +100,24 @@ const Layout = () => {
                 <Settings className="w-4 h-4" />
                 <span className="hidden sm:inline">Config</span>
               </Link>
+
+              {/* User info & logout */}
+              {user && (
+                <div className="flex items-center gap-2 ml-4 pl-4 border-l border-neon-green/20">
+                  <span className="text-xs text-gray-400 flex items-center gap-1">
+                    <User className="w-3 h-3" />
+                    @{user.username}
+                  </span>
+                  <button
+                    onClick={handleLogout}
+                    className="p-2 text-gray-400 hover:text-neon-pink transition-colors"
+                    title="Logout"
+                    data-testid="btn-user-logout"
+                  >
+                    <LogOut className="w-4 h-4" />
+                  </button>
+                </div>
+              )}
             </nav>
           </div>
         </div>

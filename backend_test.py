@@ -18,6 +18,7 @@ class GhostMailAPITester:
         self.tests_passed = 0
         self.failed_tests = []
         self.test_results = {}
+        self.admin_token = None
 
     def log_result(self, test_name: str, success: bool, message: str = "", response_data: Dict = None):
         """Log test result"""
@@ -105,28 +106,129 @@ class GhostMailAPITester:
             200
         )
 
+    def test_admin_login(self):
+        """Test admin login with correct password"""
+        success, data, _ = self.run_test(
+            "Admin Login",
+            "POST",
+            "admin/login",
+            200,
+            data={"password": "ghostmail_admin_2024"}
+        )
+        
+        if success and data.get('token'):
+            self.admin_token = data['token']
+            print(f"   Admin token obtained: {self.admin_token[:20]}...")
+        
+        return success, data
+    
+    def test_admin_login_invalid(self):
+        """Test admin login with invalid password"""
+        return self.run_test(
+            "Admin Login (Invalid Password)",
+            "POST",
+            "admin/login",
+            401,
+            data={"password": "wrong_password"}
+        )
+    
+    def test_admin_verify(self):
+        """Test admin session verification"""
+        if not self.admin_token:
+            self.log_result("Admin Verify", False, "No admin token available")
+            return False, {}
+        
+        headers = {"Authorization": f"Bearer {self.admin_token}"}
+        return self.run_test(
+            "Admin Session Verify", 
+            "GET",
+            "admin/verify",
+            200,
+            headers=headers
+        )
+    
+    def test_auth_status(self):
+        """Test auth status endpoint"""
+        return self.run_test(
+            "Auth Status",
+            "GET", 
+            "auth/status",
+            200
+        )
+
     def test_admin_config_get(self):
         """Test getting admin configuration"""
+        if not self.admin_token:
+            self.log_result("Get Admin Config", False, "No admin token available")
+            return False, {}
+        
+        headers = {"Authorization": f"Bearer {self.admin_token}"}
         return self.run_test(
             "Get Admin Config",
             "GET",
             "admin/config",
-            200
+            200,
+            headers=headers
         )
 
     def test_admin_config_update(self):
         """Test updating admin configuration"""
+        if not self.admin_token:
+            self.log_result("Update Admin Config", False, "No admin token available")
+            return False, {}
+            
         config_data = {
-            "email_domain": "test.resend.dev",
-            "default_expiration_hours": 24
+            "default_expiration_hours": 24,
+            "website_auth_enabled": False,
+            "telegram_auth_enabled": False
         }
+        
+        headers = {"Authorization": f"Bearer {self.admin_token}"}
         return self.run_test(
             "Update Admin Config",
             "PUT",
             "admin/config",
             200,
-            data=config_data
+            data=config_data,
+            headers=headers
         )
+    
+    def test_admin_domain_management(self):
+        """Test domain management operations"""
+        if not self.admin_token:
+            self.log_result("Admin Domain Management", False, "No admin token available")
+            return False, {}
+        
+        headers = {"Authorization": f"Bearer {self.admin_token}"}
+        
+        # Test adding domain
+        domain_data = {
+            "domain": f"test{int(time.time())}.example.com",
+            "provider": "resend",
+            "is_default": False
+        }
+        
+        success1, data1, _ = self.run_test(
+            "Add Domain",
+            "POST", 
+            "admin/domains",
+            200,
+            data=domain_data,
+            headers=headers
+        )
+        
+        # Test removing domain (if add succeeded)
+        if success1:
+            success2, data2, _ = self.run_test(
+                "Remove Domain",
+                "DELETE",
+                f"admin/domains/{domain_data['domain']}",
+                200,
+                headers=headers
+            )
+            return success1 and success2, {"add": data1, "remove": data2}
+        
+        return success1, data1
 
     def test_email_generation(self):
         """Test email generation with various parameters"""
@@ -263,15 +365,23 @@ class GhostMailAPITester:
         # Test 1: Basic health checks
         print("\n📊 PHASE 1: HEALTH CHECKS")
         self.test_health_check()
+        self.test_auth_status()
         self.test_stats_endpoint()
         
-        # Test 2: Admin configuration
-        print("\n⚙️  PHASE 2: ADMIN CONFIGURATION")
+        # Test 2: Admin authentication and configuration  
+        print("\n🔐 PHASE 2: ADMIN AUTHENTICATION")
+        self.test_admin_login_invalid()
+        self.test_admin_login()
+        self.test_admin_verify()
+        
+        # Test 3: Admin configuration management
+        print("\n⚙️  PHASE 3: ADMIN CONFIGURATION")
         self.test_admin_config_get()
         self.test_admin_config_update()
+        self.test_admin_domain_management()
         
-        # Test 3: Email operations (full CRUD)
-        print("\n📧 PHASE 3: EMAIL OPERATIONS")
+        # Test 4: Email operations (full CRUD)
+        print("\n📧 PHASE 4: EMAIL OPERATIONS")
         email_id = self.test_email_generation()
         self.test_email_list()
         
@@ -282,8 +392,8 @@ class GhostMailAPITester:
             time.sleep(1)  # Small delay
             self.test_email_deletion(email_id)
         
-        # Test 4: Webhook endpoints
-        print("\n🔗 PHASE 4: WEBHOOK ENDPOINTS")
+        # Test 5: Webhook endpoints
+        print("\n🔗 PHASE 5: WEBHOOK ENDPOINTS")
         self.test_webhook_endpoints()
         
         # Final results

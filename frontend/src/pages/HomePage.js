@@ -12,14 +12,17 @@ import {
   Zap,
   Shield,
   Bot,
-  ChevronRight
+  ChevronRight,
+  Globe
 } from "lucide-react";
 import { toast } from "sonner";
-import { generateEmail, listEmails, deleteEmail, getStats } from "../lib/api";
+import { generateEmail, listEmails, deleteEmail, getStats, listDomains } from "../lib/api";
 
 const HomePage = () => {
   const navigate = useNavigate();
   const [emails, setEmails] = useState([]);
+  const [domains, setDomains] = useState([]);
+  const [selectedDomain, setSelectedDomain] = useState("");
   const [loading, setLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [customPrefix, setCustomPrefix] = useState("");
@@ -29,6 +32,7 @@ const HomePage = () => {
   useEffect(() => {
     loadEmails();
     loadStats();
+    loadDomains();
   }, []);
 
   const loadEmails = async () => {
@@ -52,12 +56,25 @@ const HomePage = () => {
     }
   };
 
+  const loadDomains = async () => {
+    try {
+      const data = await listDomains();
+      setDomains(data.domains || []);
+      if (data.domains?.length > 0 && !selectedDomain) {
+        setSelectedDomain(data.domains[0]);
+      }
+    } catch (error) {
+      console.error("Failed to load domains");
+    }
+  };
+
   const handleGenerate = async () => {
     setGenerating(true);
     try {
       const data = {
         custom_prefix: customPrefix || null,
         expiration_hours: expirationHours ? parseInt(expirationHours) : null,
+        domain: selectedDomain || null,
       };
       const result = await generateEmail(data);
       if (result.status === "success") {
@@ -199,6 +216,26 @@ const HomePage = () => {
               />
             </div>
           </div>
+          
+          {/* Domain Selection */}
+          {domains.length > 1 && (
+            <div>
+              <label className="block text-xs text-gray-500 uppercase tracking-widest mb-2">
+                <Globe className="w-3 h-3 inline mr-1" />
+                Domain
+              </label>
+              <select
+                value={selectedDomain}
+                onChange={(e) => setSelectedDomain(e.target.value)}
+                className="cyber-input w-full"
+                data-testid="select-domain"
+              >
+                {domains.map((domain) => (
+                  <option key={domain} value={domain}>{domain}</option>
+                ))}
+              </select>
+            </div>
+          )}
           
           <button
             onClick={handleGenerate}
