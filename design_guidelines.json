@@ -1,0 +1,141 @@
+{
+  "project_identity": {
+    "name": "GhostMail",
+    "persona": "The Netrunner's Terminal",
+    "core_philosophy": "Functionality over Form. Stealth over Shine. The interface should feel like a CLI tool running in a browser.",
+    "emotional_tone": "Secretive, Powerful, Technical, Urgent",
+    "visual_archetype": "Cyberpunk Terminal / Retro-Futurism"
+  },
+  "typography": {
+    "font_family": {
+      "primary": "JetBrains Mono, Fira Code, monospace",
+      "display": "Orbitron, Press Start 2P, cursive",
+      "body": "JetBrains Mono, monospace"
+    },
+    "scaling": {
+      "h1": "text-4xl md:text-6xl tracking-tighter uppercase",
+      "h2": "text-2xl md:text-4xl tracking-tight uppercase",
+      "body": "text-sm md:text-base leading-relaxed"
+    },
+    "rules": [
+      "Use ALL CAPS for headers and labels to mimic military/system interfaces.",
+      "Use 'tracking-widest' for small labels.",
+      "Text should often look like it's being 'typed' out (typing animation)."
+    ]
+  },
+  "colors": {
+    "palette": {
+      "background": {
+        "default": "#050505",
+        "paper": "#0a0a0a",
+        "overlay": "#111111"
+      },
+      "foreground": {
+        "default": "#e5e5e5",
+        "muted": "#737373",
+        "terminal": "#00ff41"
+      },
+      "accent": {
+        "primary": "#00ff41",
+        "secondary": "#00f3ff",
+        "destructive": "#ff0055",
+        "warning": "#facc15"
+      },
+      "border": {
+        "default": "#333333",
+        "active": "#00ff41"
+      }
+    },
+    "tailwind_config_extension": {
+      "colors": {
+        "cyber-black": "#020202",
+        "cyber-gray": "#121212",
+        "neon-green": "#00ff41",
+        "neon-blue": "#00f3ff",
+        "neon-pink": "#ff0055",
+        "matrix-dark": "#0d0d0d"
+      }
+    },
+    "usage_rules": [
+      "Backgrounds must be almost pitch black.",
+      "Text color should default to 'neon-green' or 'gray-300' depending on hierarchy.",
+      "Use 'neon-pink' strictly for Errors or Destructive actions.",
+      "Borders are critical. Use 1px borders with 'border-neon-green/30' to define areas."
+    ]
+  },
+  "visual_enhancers": {
+    "decorations": [
+      {
+        "name": "Scanlines",
+        "css": "background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06)); background-size: 100% 2px, 3px 100%; pointer-events: none;"
+      },
+      {
+        "name": "Glow",
+        "css": "text-shadow: 0 0 5px rgba(0, 255, 65, 0.5), 0 0 10px rgba(0, 255, 65, 0.3);"
+      },
+      {
+        "name": "CRT Flicker",
+        "css": "animation: flicker 0.15s infinite;"
+      }
+    ],
+    "textures": [
+      "Grid lines overlay (background-image: linear-gradient(...))",
+      "Noise texture opacity-5"
+    ]
+  },
+  "components": {
+    "buttons": {
+      "default": "bg-transparent border border-neon-green text-neon-green hover:bg-neon-green hover:text-black rounded-none uppercase tracking-widest text-xs px-6 py-3 transition-all duration-75",
+      "primary": "bg-neon-green text-black font-bold uppercase hover:bg-white hover:shadow-[0_0_15px_rgba(0,255,65,0.5)] rounded-none",
+      "destructive": "border border-neon-pink text-neon-pink hover:bg-neon-pink hover:text-white rounded-none"
+    },
+    "cards": {
+      "style": "bg-cyber-gray/90 border border-neon-green/20 backdrop-blur-sm rounded-none relative",
+      "header_style": "border-b border-neon-green/20 bg-neon-green/5 p-2 flex justify-between items-center"
+    },
+    "inputs": {
+      "style": "bg-black border-b border-neon-green/50 focus:border-neon-green text-neon-green placeholder:text-neon-green/30 outline-none rounded-none px-2 py-2 font-mono"
+    },
+    "layout_wrappers": {
+      "main_container": "min-h-screen bg-cyber-black text-neon-green font-mono relative overflow-x-hidden selection:bg-neon-green selection:text-black"
+    }
+  },
+  "layout_strategy": {
+    "grid_system": "Use CSS Grid with explicit lines. Think 'Dashboard' or 'Cockpit'.",
+    "spacing": "Compact. Use 'gap-2' or 'gap-4'. Terminals are dense.",
+    "containers": "Everything lives in a 'Window' or a 'Panel'. No floating text."
+  },
+  "motion": {
+    "types": [
+      "Glitch effect on load",
+      "Typing effect for headers",
+      "Blink cursor for inputs",
+      "Instant transitions (0s or 75ms). No smooth 500ms fades. Machines are fast."
+    ]
+  },
+  "image_assets": {
+    "backgrounds": [
+      "https://images.pexels.com/photos/31419072/pexels-photo-31419072.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940"
+    ],
+    "placeholders": "https://placehold.co/600x400/000000/00ff41/png?text=NO+SIGNAL"
+  },
+  "libraries": {
+    "required": [
+      "framer-motion (for glitch/typing)",
+      "lucide-react (icons)",
+      "clsx",
+      "tailwind-merge"
+    ],
+    "optional": [
+      "react-type-animation"
+    ]
+  },
+  "universal_guidelines": [
+    "NEVER use rounded corners > 2px. Sharp edges only.",
+    "ALWAYS use Monospace fonts.",
+    "Use uppercase for all labels.",
+    "Add 'data-testid' to all interactive elements.",
+    "Avoid gradients unless it's a 'scanline' or 'grid' effect.",
+    "The UI should look like it could run on a CRT monitor."
+  ]
+}
