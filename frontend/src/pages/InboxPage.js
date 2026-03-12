@@ -58,10 +58,27 @@ const InboxPage = () => {
     return () => clearInterval(interval);
   }, [loadInbox]);
 
-  const handleCopy = () => {
+  const handleCopy = async () => {
     if (tempEmail) {
-      navigator.clipboard.writeText(tempEmail.email_address);
-      toast.success("Email copied to clipboard");
+      try {
+        await navigator.clipboard.writeText(tempEmail.email_address);
+        toast.success("Email copied to clipboard");
+      } catch (error) {
+        // Fallback for browsers without clipboard API permission
+        const textArea = document.createElement("textarea");
+        textArea.value = tempEmail.email_address;
+        textArea.style.position = "fixed";
+        textArea.style.left = "-9999px";
+        document.body.appendChild(textArea);
+        textArea.select();
+        try {
+          document.execCommand("copy");
+          toast.success("Email copied to clipboard");
+        } catch (err) {
+          toast.error("Failed to copy to clipboard");
+        }
+        document.body.removeChild(textArea);
+      }
     }
   };
 

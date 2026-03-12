@@ -76,9 +76,26 @@ const HomePage = () => {
     }
   };
 
-  const handleCopy = (email) => {
-    navigator.clipboard.writeText(email);
-    toast.success("Copied to clipboard");
+  const handleCopy = async (email) => {
+    try {
+      await navigator.clipboard.writeText(email);
+      toast.success("Copied to clipboard");
+    } catch (error) {
+      // Fallback for browsers without clipboard API permission
+      const textArea = document.createElement("textarea");
+      textArea.value = email;
+      textArea.style.position = "fixed";
+      textArea.style.left = "-9999px";
+      document.body.appendChild(textArea);
+      textArea.select();
+      try {
+        document.execCommand("copy");
+        toast.success("Copied to clipboard");
+      } catch (err) {
+        toast.error("Failed to copy to clipboard");
+      }
+      document.body.removeChild(textArea);
+    }
   };
 
   const handleDelete = async (emailId) => {
