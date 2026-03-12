@@ -13,36 +13,44 @@ from datetime import datetime, timezone, timedelta
 import asyncio
 import resend
 import httpx
-import hashlib
 import secrets
-import json
 import base64
 import random
 import string
 
+# Load environment variables
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+env_path = ROOT_DIR / '.env'
+if env_path.exists():
+    load_dotenv(env_path)
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# MongoDB connection settings
+MONGO_URL = os.environ.get('MONGO_URL', os.environ.get('MONGODB_URI', ''))
+DB_NAME = os.environ.get('DB_NAME', 'ghostmail')
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'ghostmail_admin_2024')
+
+# Initialize MongoDB client (lazy connection)
+_client = None
+_db = None
+
+def get_db():
+    global _client, _db
+    if _client is None:
+        if not MONGO_URL:
+            raise HTTPException(status_code=500, detail="Database not configured. Set MONGO_URL environment variable.")
+        _client = AsyncIOMotorClient(MONGO_URL)
+        _db = _client[DB_NAME]
+    return _db
 
 # Create the main app
-app = FastAPI()
+app = FastAPI(title="GhostMail API", version="1.0.0")
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# Admin password from environment
-ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'ghostmail_admin_2024')
 
 # ==================== MODELS ====================
 
@@ -53,14 +61,12 @@ class ConfigModel(BaseModel):
     email_domains: List[dict] = Field(default_factory=lambda: [{"domain": "resend.dev", "provider": "resend", "is_default": True}])
     webhook_secret: str = Field(default_factory=lambda: secrets.token_urlsafe(32))
     default_expiration_hours: Optional[int] = None
-    # Authorization settings
     website_auth_enabled: bool = False
     telegram_auth_enabled: bool = False
-    authorized_telegram_users: List[int] = []  # List of authorized chat_ids
-    # Cloudflare settings
+    authorized_telegram_users: List[int] = []
     cloudflare_api_token: Optional[str] = None
     cloudflare_account_id: Optional[str] = None
-    cloudflare_zone_ids: List[dict] = []  # [{zone_id, domain}]
+    cloudflare_zone_ids: List[dict] = []
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -79,7 +85,7 @@ class ConfigUpdate(BaseModel):
 
 class DomainAdd(BaseModel):
     domain: str
-    provider: str = "resend"  # resend or cloudflare
+    provider: str = "resend"
     is_default: bool = False
     cloudflare_zone_id: Optional[str] = None
 
@@ -127,16 +133,6 @@ class TelegramUser(BaseModel):
     is_authorized: bool = False
     registered_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-class WebSession(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    telegram_chat_id: int
-    telegram_username: str
-    otp_code: str
-    otp_expires_at: datetime
-    is_verified: bool = False
-    session_token: Optional[str] = None
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
 class LoginRequest(BaseModel):
     telegram_username: str
 
@@ -150,86 +146,68 @@ class AdminLoginRequest(BaseModel):
 # ==================== AUTH HELPERS ====================
 
 def verify_admin_password(password: str) -> bool:
-    """Verify admin password"""
     return password == ADMIN_PASSWORD
 
 async def verify_admin_token(authorization: Optional[str] = Header(None)):
-    """Verify admin authorization header"""
     if not authorization:
         raise HTTPException(status_code=401, detail="Authorization required")
-    
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization format")
     
     token = authorization[7:]
-    
-    # Check if it's a valid admin session
+    db = get_db()
     session = await db.admin_sessions.find_one({"token": token, "is_valid": True}, {"_id": 0})
     if not session:
         raise HTTPException(status_code=401, detail="Invalid or expired session")
     
-    # Check expiration
     expires_at = datetime.fromisoformat(session['expires_at']) if isinstance(session['expires_at'], str) else session['expires_at']
     if datetime.now(timezone.utc) > expires_at.replace(tzinfo=timezone.utc):
         await db.admin_sessions.update_one({"token": token}, {"$set": {"is_valid": False}})
         raise HTTPException(status_code=401, detail="Session expired")
-    
     return True
 
 async def verify_user_session(authorization: Optional[str] = Header(None)):
-    """Verify user session token"""
     config = await get_config()
-    
-    # If website auth is disabled, allow access
     if not config.get('website_auth_enabled', False):
         return None
-    
     if not authorization:
         raise HTTPException(status_code=401, detail="Authorization required")
-    
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization format")
     
     token = authorization[7:]
-    
+    db = get_db()
     session = await db.web_sessions.find_one({"session_token": token, "is_verified": True}, {"_id": 0})
     if not session:
         raise HTTPException(status_code=401, detail="Invalid or expired session")
-    
     return session
 
 def generate_otp():
-    """Generate 6-digit OTP"""
     return ''.join(random.choices(string.digits, k=6))
 
 def generate_session_token():
-    """Generate secure session token"""
     return secrets.token_urlsafe(32)
 
 # ==================== HELPER FUNCTIONS ====================
 
 async def get_config():
-    """Get or create default config"""
+    db = get_db()
     config = await db.config.find_one({}, {"_id": 0})
     if not config:
         default_config = ConfigModel()
         config_dict = default_config.model_dump()
         config_dict['created_at'] = config_dict['created_at'].isoformat()
         config_dict['updated_at'] = config_dict['updated_at'].isoformat()
-        insert_doc = config_dict.copy()
-        await db.config.insert_one(insert_doc)
+        await db.config.insert_one(config_dict.copy())
         return config_dict
     return config
 
 def generate_email_prefix():
-    """Generate a random email prefix"""
     adjectives = ["ghost", "shadow", "cyber", "dark", "null", "void", "pixel", "binary", "crypto", "stealth"]
     nouns = ["mail", "runner", "byte", "bit", "node", "packet", "signal", "pulse", "wave", "flux"]
-    import random
     return f"{random.choice(adjectives)}{random.choice(nouns)}{random.randint(100, 999)}"
 
 async def get_default_domain():
-    """Get default email domain"""
     config = await get_config()
     domains = config.get('email_domains', [])
     for d in domains:
@@ -238,22 +216,16 @@ async def get_default_domain():
     return domains[0].get('domain', 'resend.dev') if domains else 'resend.dev'
 
 async def send_telegram_message(chat_id: int, text: str, parse_mode: str = "HTML"):
-    """Send message to Telegram user"""
     config = await get_config()
     token = config.get('telegram_bot_token')
     if not token:
         logger.warning("Telegram bot token not configured")
         return False
-    
     try:
         async with httpx.AsyncClient() as http_client:
             response = await http_client.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": text,
-                    "parse_mode": parse_mode
-                }
+                json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
             )
             return response.status_code == 200
     except Exception as e:
@@ -261,34 +233,27 @@ async def send_telegram_message(chat_id: int, text: str, parse_mode: str = "HTML
         return False
 
 async def send_telegram_document(chat_id: int, file_content: bytes, filename: str, caption: str = ""):
-    """Send document to Telegram user"""
     config = await get_config()
     token = config.get('telegram_bot_token')
     if not token:
         return False
-    
     try:
         async with httpx.AsyncClient() as http_client:
             files = {"document": (filename, file_content)}
             data = {"chat_id": chat_id, "caption": caption}
-            response = await http_client.post(
-                f"https://api.telegram.org/bot{token}/sendDocument",
-                files=files,
-                data=data
-            )
+            response = await http_client.post(f"https://api.telegram.org/bot{token}/sendDocument", files=files, data=data)
             return response.status_code == 200
     except Exception as e:
         logger.error(f"Failed to send Telegram document: {e}")
         return False
 
 async def forward_email_to_telegram(inbox_email: dict):
-    """Forward received email to linked Telegram account"""
+    db = get_db()
     temp_email = await db.temp_emails.find_one({"id": inbox_email['temp_email_id']}, {"_id": 0})
     if not temp_email or not temp_email.get('telegram_chat_id'):
         return
     
     chat_id = temp_email['telegram_chat_id']
-    
     message = f"""📬 <b>NEW EMAIL RECEIVED</b>
 
 <b>From:</b> {inbox_email.get('from_name', '')} &lt;{inbox_email['from_address']}&gt;
@@ -305,77 +270,55 @@ async def forward_email_to_telegram(inbox_email: dict):
         if attachment.get('content'):
             try:
                 content = base64.b64decode(attachment['content'])
-                await send_telegram_document(
-                    chat_id,
-                    content,
-                    attachment.get('filename', 'attachment'),
-                    f"📎 Attachment from: {inbox_email['from_address']}"
-                )
+                await send_telegram_document(chat_id, content, attachment.get('filename', 'attachment'), f"📎 Attachment from: {inbox_email['from_address']}")
             except Exception as e:
                 logger.error(f"Failed to send attachment: {e}")
     
-    await db.inbox.update_one(
-        {"id": inbox_email['id']},
-        {"$set": {"forwarded_to_telegram": True}}
-    )
+    await db.inbox.update_one({"id": inbox_email['id']}, {"$set": {"forwarded_to_telegram": True}})
 
 async def is_telegram_user_authorized(chat_id: int) -> bool:
-    """Check if telegram user is authorized"""
     config = await get_config()
-    
     if not config.get('telegram_auth_enabled', False):
         return True
-    
-    authorized_users = config.get('authorized_telegram_users', [])
-    return chat_id in authorized_users
+    return chat_id in config.get('authorized_telegram_users', [])
 
 # ==================== ADMIN AUTH ENDPOINTS ====================
 
 @api_router.post("/admin/login")
 async def admin_login(request: AdminLoginRequest):
-    """Admin login endpoint"""
     if not verify_admin_password(request.password):
         raise HTTPException(status_code=401, detail="Invalid password")
     
     token = generate_session_token()
     expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
     
-    session_doc = {
-        "token": token,
-        "is_valid": True,
+    db = get_db()
+    await db.admin_sessions.insert_one({
+        "token": token, "is_valid": True,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "expires_at": expires_at.isoformat()
-    }
-    await db.admin_sessions.insert_one(session_doc)
+    })
     
-    return {
-        "status": "success",
-        "token": token,
-        "expires_at": expires_at.isoformat()
-    }
+    return {"status": "success", "token": token, "expires_at": expires_at.isoformat()}
 
 @api_router.post("/admin/logout")
 async def admin_logout(authorized: bool = Depends(verify_admin_token)):
-    """Admin logout endpoint"""
     return {"status": "success", "message": "Logged out"}
 
 @api_router.get("/admin/verify")
 async def verify_admin(authorized: bool = Depends(verify_admin_token)):
-    """Verify admin session"""
     return {"status": "success", "authenticated": True}
 
 # ==================== USER AUTH ENDPOINTS ====================
 
 @api_router.post("/auth/request-otp")
 async def request_otp(request: LoginRequest):
-    """Request OTP for website login"""
     config = await get_config()
-    
     if not config.get('website_auth_enabled', False):
         return {"status": "success", "message": "Authentication disabled", "auth_disabled": True}
     
     telegram_username = request.telegram_username.lower().replace("@", "")
-    
+    db = get_db()
     user = await db.telegram_users.find_one({"username": telegram_username}, {"_id": 0})
     if not user:
         raise HTTPException(status_code=404, detail="User not found. Please start the Telegram bot first with /start")
@@ -384,14 +327,10 @@ async def request_otp(request: LoginRequest):
     otp_expires = datetime.now(timezone.utc) + timedelta(minutes=5)
     
     session_doc = {
-        "id": str(uuid.uuid4()),
-        "telegram_chat_id": user['chat_id'],
-        "telegram_username": telegram_username,
-        "otp_code": otp,
-        "otp_expires_at": otp_expires.isoformat(),
-        "is_verified": False,
-        "session_token": None,
-        "created_at": datetime.now(timezone.utc).isoformat()
+        "id": str(uuid.uuid4()), "telegram_chat_id": user['chat_id'],
+        "telegram_username": telegram_username, "otp_code": otp,
+        "otp_expires_at": otp_expires.isoformat(), "is_verified": False,
+        "session_token": None, "created_at": datetime.now(timezone.utc).isoformat()
     }
     
     await db.web_sessions.delete_many({"telegram_username": telegram_username, "is_verified": False})
@@ -415,18 +354,14 @@ Your OTP code for GhostMail website login:
 
 @api_router.post("/auth/verify-otp")
 async def verify_otp(request: VerifyOTPRequest):
-    """Verify OTP and create session"""
     config = await get_config()
-    
     if not config.get('website_auth_enabled', False):
         return {"status": "success", "message": "Authentication disabled", "auth_disabled": True}
     
     telegram_username = request.telegram_username.lower().replace("@", "")
-    
+    db = get_db()
     session = await db.web_sessions.find_one({
-        "telegram_username": telegram_username,
-        "otp_code": request.otp_code,
-        "is_verified": False
+        "telegram_username": telegram_username, "otp_code": request.otp_code, "is_verified": False
     }, {"_id": 0})
     
     if not session:
@@ -437,54 +372,31 @@ async def verify_otp(request: VerifyOTPRequest):
         raise HTTPException(status_code=400, detail="OTP has expired")
     
     session_token = generate_session_token()
-    
-    await db.web_sessions.update_one(
-        {"id": session['id']},
-        {"$set": {"is_verified": True, "session_token": session_token}}
-    )
+    await db.web_sessions.update_one({"id": session['id']}, {"$set": {"is_verified": True, "session_token": session_token}})
     
     user = await db.telegram_users.find_one({"username": telegram_username}, {"_id": 0})
     
     return {
-        "status": "success",
-        "token": session_token,
-        "user": {
-            "username": telegram_username,
-            "chat_id": session['telegram_chat_id'],
-            "first_name": user.get('first_name', '') if user else ''
-        }
+        "status": "success", "token": session_token,
+        "user": {"username": telegram_username, "chat_id": session['telegram_chat_id'], "first_name": user.get('first_name', '') if user else ''}
     }
 
 @api_router.get("/auth/status")
 async def auth_status():
-    """Get authentication status"""
     config = await get_config()
-    return {
-        "website_auth_enabled": config.get('website_auth_enabled', False),
-        "telegram_auth_enabled": config.get('telegram_auth_enabled', False)
-    }
+    return {"website_auth_enabled": config.get('website_auth_enabled', False), "telegram_auth_enabled": config.get('telegram_auth_enabled', False)}
 
 @api_router.get("/auth/me")
 async def get_current_user(session = Depends(verify_user_session)):
-    """Get current logged in user"""
     if session is None:
         return {"authenticated": False, "auth_disabled": True}
-    
-    return {
-        "authenticated": True,
-        "user": {
-            "username": session.get('telegram_username'),
-            "chat_id": session.get('telegram_chat_id')
-        }
-    }
+    return {"authenticated": True, "user": {"username": session.get('telegram_username'), "chat_id": session.get('telegram_chat_id')}}
 
 # ==================== CONFIG ENDPOINTS ====================
 
 @api_router.get("/admin/config")
 async def get_admin_config(authorized: bool = Depends(verify_admin_token)):
-    """Get current configuration (masks sensitive data)"""
     config = await get_config()
-    
     if config.get('resend_api_key'):
         key = config['resend_api_key']
         config['resend_api_key'] = f"{key[:10]}...{key[-4:]}" if len(key) > 14 else "***"
@@ -494,20 +406,16 @@ async def get_admin_config(authorized: bool = Depends(verify_admin_token)):
     if config.get('cloudflare_api_token'):
         token = config['cloudflare_api_token']
         config['cloudflare_api_token'] = f"{token[:10]}...{token[-4:]}" if len(token) > 14 else "***"
-    
     return config
 
 @api_router.put("/admin/config")
 async def update_admin_config(update: ConfigUpdate, authorized: bool = Depends(verify_admin_token)):
-    """Update configuration"""
     config = await get_config()
     update_dict = {k: v for k, v in update.model_dump().items() if v is not None}
     update_dict['updated_at'] = datetime.now(timezone.utc).isoformat()
     
-    await db.config.update_one(
-        {"id": config['id']},
-        {"$set": update_dict}
-    )
+    db = get_db()
+    await db.config.update_one({"id": config['id']}, {"$set": update_dict})
     
     if update.telegram_bot_token:
         await setup_telegram_webhook(update.telegram_bot_token, config.get('webhook_secret', ''))
@@ -516,7 +424,6 @@ async def update_admin_config(update: ConfigUpdate, authorized: bool = Depends(v
 
 @api_router.post("/admin/domains")
 async def add_domain(domain_data: DomainAdd, authorized: bool = Depends(verify_admin_token)):
-    """Add a new email domain"""
     config = await get_config()
     domains = config.get('email_domains', [])
     
@@ -528,87 +435,68 @@ async def add_domain(domain_data: DomainAdd, authorized: bool = Depends(verify_a
         for d in domains:
             d['is_default'] = False
     
-    new_domain = {
-        "domain": domain_data.domain,
-        "provider": domain_data.provider,
-        "is_default": domain_data.is_default,
-        "cloudflare_zone_id": domain_data.cloudflare_zone_id,
+    domains.append({
+        "domain": domain_data.domain, "provider": domain_data.provider,
+        "is_default": domain_data.is_default, "cloudflare_zone_id": domain_data.cloudflare_zone_id,
         "added_at": datetime.now(timezone.utc).isoformat()
-    }
-    domains.append(new_domain)
+    })
     
-    await db.config.update_one(
-        {"id": config['id']},
-        {"$set": {"email_domains": domains, "updated_at": datetime.now(timezone.utc).isoformat()}}
-    )
+    db = get_db()
+    await db.config.update_one({"id": config['id']}, {"$set": {"email_domains": domains, "updated_at": datetime.now(timezone.utc).isoformat()}})
     
     return {"status": "success", "message": "Domain added", "domains": domains}
 
 @api_router.delete("/admin/domains/{domain}")
 async def remove_domain(domain: str, authorized: bool = Depends(verify_admin_token)):
-    """Remove an email domain"""
     config = await get_config()
-    domains = config.get('email_domains', [])
-    
-    domains = [d for d in domains if d.get('domain') != domain]
+    domains = [d for d in config.get('email_domains', []) if d.get('domain') != domain]
     
     if not domains:
         domains = [{"domain": "resend.dev", "provider": "resend", "is_default": True}]
     elif not any(d.get('is_default') for d in domains):
         domains[0]['is_default'] = True
     
-    await db.config.update_one(
-        {"id": config['id']},
-        {"$set": {"email_domains": domains, "updated_at": datetime.now(timezone.utc).isoformat()}}
-    )
+    db = get_db()
+    await db.config.update_one({"id": config['id']}, {"$set": {"email_domains": domains, "updated_at": datetime.now(timezone.utc).isoformat()}})
     
     return {"status": "success", "message": "Domain removed", "domains": domains}
 
 @api_router.post("/admin/authorize-telegram-user/{chat_id}")
 async def authorize_telegram_user(chat_id: int, authorized: bool = Depends(verify_admin_token)):
-    """Authorize a Telegram user"""
     config = await get_config()
     authorized_users = config.get('authorized_telegram_users', [])
     
     if chat_id not in authorized_users:
         authorized_users.append(chat_id)
-        await db.config.update_one(
-            {"id": config['id']},
-            {"$set": {"authorized_telegram_users": authorized_users}}
-        )
+        db = get_db()
+        await db.config.update_one({"id": config['id']}, {"$set": {"authorized_telegram_users": authorized_users}})
     
     return {"status": "success", "message": f"User {chat_id} authorized"}
 
 @api_router.delete("/admin/authorize-telegram-user/{chat_id}")
 async def revoke_telegram_user(chat_id: int, authorized: bool = Depends(verify_admin_token)):
-    """Revoke Telegram user authorization"""
     config = await get_config()
     authorized_users = config.get('authorized_telegram_users', [])
     
     if chat_id in authorized_users:
         authorized_users.remove(chat_id)
-        await db.config.update_one(
-            {"id": config['id']},
-            {"$set": {"authorized_telegram_users": authorized_users}}
-        )
+        db = get_db()
+        await db.config.update_one({"id": config['id']}, {"$set": {"authorized_telegram_users": authorized_users}})
     
     return {"status": "success", "message": f"User {chat_id} authorization revoked"}
 
 async def setup_telegram_webhook(token: str, webhook_secret: str):
-    """Setup Telegram webhook"""
-    backend_url = os.environ.get('BACKEND_URL', '')
+    backend_url = os.environ.get('BACKEND_URL', os.environ.get('VERCEL_URL', ''))
+    if backend_url and not backend_url.startswith('http'):
+        backend_url = f"https://{backend_url}"
     if not backend_url:
         logger.warning("BACKEND_URL not set, cannot setup Telegram webhook")
         return
     
     webhook_url = f"{backend_url}/api/webhook/telegram/{webhook_secret}"
-    
     try:
         async with httpx.AsyncClient() as http_client:
-            response = await http_client.post(
-                f"https://api.telegram.org/bot{token}/setWebhook",
-                json={"url": webhook_url}
-            )
+            response = await http_client.post(f"https://api.telegram.org/bot{token}/setWebhook", json={"url": webhook_url})
             logger.info(f"Telegram webhook setup response: {response.json()}")
     except Exception as e:
         logger.error(f"Failed to setup Telegram webhook: {e}")
@@ -617,7 +505,6 @@ async def setup_telegram_webhook(token: str, webhook_secret: str):
 
 @api_router.post("/email/generate")
 async def generate_temp_email(request: TempEmailCreate, session = Depends(verify_user_session)):
-    """Generate a new temporary email address"""
     config = await get_config()
     
     prefix = request.custom_prefix if request.custom_prefix else generate_email_prefix()
@@ -626,6 +513,7 @@ async def generate_temp_email(request: TempEmailCreate, session = Depends(verify
     domain = request.domain if request.domain else await get_default_domain()
     email_address = f"{prefix}@{domain}"
     
+    db = get_db()
     existing = await db.temp_emails.find_one({"email_address": email_address, "is_active": True}, {"_id": 0})
     if existing:
         return {"status": "error", "message": "Email address already exists"}
@@ -635,74 +523,57 @@ async def generate_temp_email(request: TempEmailCreate, session = Depends(verify
     if expiration_hours:
         expires_at = datetime.now(timezone.utc) + timedelta(hours=expiration_hours)
     
-    temp_email = TempEmail(
-        email_address=email_address,
-        expires_at=expires_at,
-        telegram_chat_id=request.telegram_chat_id
-    )
-    
+    temp_email = TempEmail(email_address=email_address, expires_at=expires_at, telegram_chat_id=request.telegram_chat_id)
     email_dict = temp_email.model_dump()
     email_dict['created_at'] = email_dict['created_at'].isoformat()
     email_dict['expires_at'] = email_dict['expires_at'].isoformat() if email_dict['expires_at'] else None
     
-    insert_doc = email_dict.copy()
-    await db.temp_emails.insert_one(insert_doc)
+    await db.temp_emails.insert_one(email_dict.copy())
     
-    return {
-        "status": "success",
-        "email": email_dict
-    }
+    return {"status": "success", "email": email_dict}
 
 @api_router.get("/email/list")
 async def list_temp_emails(telegram_chat_id: Optional[int] = None, session = Depends(verify_user_session)):
-    """List all active temporary emails"""
     query = {"is_active": True}
     if telegram_chat_id:
         query["telegram_chat_id"] = telegram_chat_id
     
+    db = get_db()
     emails = await db.temp_emails.find(query, {"_id": 0}).sort("created_at", -1).to_list(100)
     return {"emails": emails}
 
 @api_router.get("/email/domains")
 async def list_domains(session = Depends(verify_user_session)):
-    """List available email domains"""
     config = await get_config()
-    domains = config.get('email_domains', [])
-    return {"domains": [d.get('domain') for d in domains]}
+    return {"domains": [d.get('domain') for d in config.get('email_domains', [])]}
 
 @api_router.get("/email/inbox/{email_id}")
 async def get_inbox(email_id: str, session = Depends(verify_user_session)):
-    """Get inbox for a temporary email"""
+    db = get_db()
     temp_email = await db.temp_emails.find_one({"id": email_id}, {"_id": 0})
     if not temp_email:
         raise HTTPException(status_code=404, detail="Email not found")
     
-    emails = await db.inbox.find(
-        {"temp_email_id": email_id},
-        {"_id": 0}
-    ).sort("received_at", -1).to_list(100)
-    
+    emails = await db.inbox.find({"temp_email_id": email_id}, {"_id": 0}).sort("received_at", -1).to_list(100)
     return {"inbox": emails, "temp_email": temp_email}
 
 @api_router.get("/email/message/{message_id}")
 async def get_email_message(message_id: str, session = Depends(verify_user_session)):
-    """Get a specific email message"""
+    db = get_db()
     message = await db.inbox.find_one({"id": message_id}, {"_id": 0})
     if not message:
         raise HTTPException(status_code=404, detail="Message not found")
     
     await db.inbox.update_one({"id": message_id}, {"$set": {"is_read": True}})
-    
     return message
 
 @api_router.post("/email/send")
 async def send_email(request: SendEmailRequest, session = Depends(verify_user_session)):
-    """Send an email from a temporary address"""
     config = await get_config()
-    
     if not config.get('resend_api_key'):
         raise HTTPException(status_code=400, detail="Resend API key not configured")
     
+    db = get_db()
     temp_email = await db.temp_emails.find_one({"id": request.from_email_id, "is_active": True}, {"_id": 0})
     if not temp_email:
         raise HTTPException(status_code=404, detail="Sender email not found or inactive")
@@ -710,81 +581,53 @@ async def send_email(request: SendEmailRequest, session = Depends(verify_user_se
     resend.api_key = config['resend_api_key']
     
     try:
-        params = {
-            "from": temp_email['email_address'],
-            "to": [request.to_email],
-            "subject": request.subject,
-            "html": request.body_html
-        }
-        
-        email_response = await asyncio.to_thread(resend.Emails.send, params)
-        
-        return {
-            "status": "success",
-            "message": f"Email sent to {request.to_email}",
-            "email_id": email_response.get("id")
-        }
+        email_response = await asyncio.to_thread(resend.Emails.send, {
+            "from": temp_email['email_address'], "to": [request.to_email],
+            "subject": request.subject, "html": request.body_html
+        })
+        return {"status": "success", "message": f"Email sent to {request.to_email}", "email_id": email_response.get("id")}
     except Exception as e:
         logger.error(f"Failed to send email: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
 
 @api_router.delete("/email/{email_id}")
 async def delete_temp_email(email_id: str, session = Depends(verify_user_session)):
-    """Delete/deactivate a temporary email"""
-    result = await db.temp_emails.update_one(
-        {"id": email_id},
-        {"$set": {"is_active": False}}
-    )
-    
+    db = get_db()
+    result = await db.temp_emails.update_one({"id": email_id}, {"$set": {"is_active": False}})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Email not found")
-    
     return {"status": "success", "message": "Email deleted"}
 
 # ==================== WEBHOOK ENDPOINTS ====================
 
 @api_router.post("/webhook/resend")
 async def resend_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Handle incoming emails from Resend webhook"""
     try:
         payload = await request.json()
         logger.info(f"Resend webhook received: {payload.get('type', 'unknown')}")
         
         if payload.get('type') == 'email.received':
             data = payload.get('data', {})
-            
             to_address = data.get('to', [''])[0] if isinstance(data.get('to'), list) else data.get('to', '')
             
-            temp_email = await db.temp_emails.find_one(
-                {"email_address": to_address, "is_active": True},
-                {"_id": 0}
-            )
-            
+            db = get_db()
+            temp_email = await db.temp_emails.find_one({"email_address": to_address, "is_active": True}, {"_id": 0})
             if not temp_email:
-                logger.warning(f"No active temp email found for: {to_address}")
                 return {"status": "ignored", "reason": "No matching email"}
             
             inbox_email = InboxEmail(
-                temp_email_id=temp_email['id'],
-                to_address=to_address,
-                from_address=data.get('from', ''),
-                from_name=data.get('from_name', ''),
-                subject=data.get('subject', 'No Subject'),
-                body_text=data.get('text', ''),
-                body_html=data.get('html', ''),
-                attachments=data.get('attachments', [])
+                temp_email_id=temp_email['id'], to_address=to_address,
+                from_address=data.get('from', ''), from_name=data.get('from_name', ''),
+                subject=data.get('subject', 'No Subject'), body_text=data.get('text', ''),
+                body_html=data.get('html', ''), attachments=data.get('attachments', [])
             )
-            
             email_dict = inbox_email.model_dump()
             email_dict['received_at'] = email_dict['received_at'].isoformat()
             
-            insert_doc = email_dict.copy()
-            await db.inbox.insert_one(insert_doc)
-            
+            await db.inbox.insert_one(email_dict.copy())
             background_tasks.add_task(forward_email_to_telegram, email_dict)
             
             return {"status": "success", "message_id": inbox_email.id}
-        
         return {"status": "ok"}
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -792,38 +635,25 @@ async def resend_webhook(request: Request, background_tasks: BackgroundTasks):
 
 @api_router.post("/webhook/cloudflare")
 async def cloudflare_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Handle incoming emails from Cloudflare Email Routing"""
     try:
         payload = await request.json()
-        logger.info(f"Cloudflare webhook received")
-        
         to_address = payload.get('to', '')
         
-        temp_email = await db.temp_emails.find_one(
-            {"email_address": to_address, "is_active": True},
-            {"_id": 0}
-        )
-        
+        db = get_db()
+        temp_email = await db.temp_emails.find_one({"email_address": to_address, "is_active": True}, {"_id": 0})
         if not temp_email:
             return {"status": "ignored", "reason": "No matching email"}
         
         inbox_email = InboxEmail(
-            temp_email_id=temp_email['id'],
-            to_address=to_address,
-            from_address=payload.get('from', ''),
-            from_name=payload.get('from_name', ''),
-            subject=payload.get('subject', 'No Subject'),
-            body_text=payload.get('text', ''),
-            body_html=payload.get('html', ''),
-            attachments=payload.get('attachments', [])
+            temp_email_id=temp_email['id'], to_address=to_address,
+            from_address=payload.get('from', ''), from_name=payload.get('from_name', ''),
+            subject=payload.get('subject', 'No Subject'), body_text=payload.get('text', ''),
+            body_html=payload.get('html', ''), attachments=payload.get('attachments', [])
         )
-        
         email_dict = inbox_email.model_dump()
         email_dict['received_at'] = email_dict['received_at'].isoformat()
         
-        insert_doc = email_dict.copy()
-        await db.inbox.insert_one(insert_doc)
-        
+        await db.inbox.insert_one(email_dict.copy())
         background_tasks.add_task(forward_email_to_telegram, email_dict)
         
         return {"status": "success", "message_id": inbox_email.id}
@@ -833,16 +663,12 @@ async def cloudflare_webhook(request: Request, background_tasks: BackgroundTasks
 
 @api_router.post("/webhook/telegram/{secret}")
 async def telegram_webhook(secret: str, request: Request, background_tasks: BackgroundTasks):
-    """Handle Telegram bot updates"""
     config = await get_config()
-    
     if secret != config.get('webhook_secret', ''):
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
     
     try:
         update = await request.json()
-        logger.info(f"Telegram update: {update}")
-        
         message = update.get('message')
         if not message:
             return {"status": "ok"}
@@ -881,29 +707,21 @@ async def telegram_webhook(secret: str, request: Request, background_tasks: Back
 # ==================== TELEGRAM BOT HANDLERS ====================
 
 async def handle_start_command(chat_id: int, username: str, first_name: str):
-    """Handle /start command"""
+    db = get_db()
     existing = await db.telegram_users.find_one({"chat_id": chat_id}, {"_id": 0})
     
     if not existing:
-        user = TelegramUser(
-            chat_id=chat_id,
-            username=username.lower() if username else None,
-            first_name=first_name
-        )
+        user = TelegramUser(chat_id=chat_id, username=username.lower() if username else None, first_name=first_name)
         user_dict = user.model_dump()
         user_dict['registered_at'] = user_dict['registered_at'].isoformat()
-        insert_doc = user_dict.copy()
-        await db.telegram_users.insert_one(insert_doc)
+        await db.telegram_users.insert_one(user_dict.copy())
     else:
-        await db.telegram_users.update_one(
-            {"chat_id": chat_id},
-            {"$set": {"username": username.lower() if username else None, "first_name": first_name}}
-        )
+        await db.telegram_users.update_one({"chat_id": chat_id}, {"$set": {"username": username.lower() if username else None, "first_name": first_name}})
     
     config = await get_config()
     auth_status = "🔓 Open Access" if not config.get('telegram_auth_enabled') else "🔐 Authorization Required"
     
-    welcome_message = f"""🔮 <b>WELCOME TO GHOSTMAIL</b>
+    await send_telegram_message(chat_id, f"""🔮 <b>WELCOME TO GHOSTMAIL</b>
 
 Hello {first_name}! I'm your secure temp email bot.
 
@@ -912,21 +730,18 @@ Hello {first_name}! I'm your secure temp email bot.
 👤 Username: @{username if username else 'not set'}
 🔑 Status: {auth_status}
 
-<b>AVAILABLE COMMANDS:</b>
+<b>COMMANDS:</b>
 /generate [prefix] - Create new temp email
 /list - Show your active emails
-/inbox - Check inbox for your email
-/delete [email_id] - Delete a temp email
-/send - Send an email (guided)
-/myid - Get your ID for website login
-/help - Show this help
+/inbox - Check inbox
+/delete [id] - Delete email
+/send to | subject | body - Send email
+/myid - Get website login ID
+/help - Show help
 
-🛡️ <i>Your privacy, our priority.</i>"""
-    
-    await send_telegram_message(chat_id, welcome_message)
+🛡️ <i>Your privacy, our priority.</i>""")
 
 async def handle_authorize_command(chat_id: int, text: str):
-    """Handle /authorize command (admin only)"""
     config = await get_config()
     authorized_users = config.get('authorized_telegram_users', [])
     
@@ -947,30 +762,23 @@ async def handle_authorize_command(chat_id: int, text: str):
     
     if target_chat_id not in authorized_users:
         authorized_users.append(target_chat_id)
-        await db.config.update_one(
-            {"id": config['id']},
-            {"$set": {"authorized_telegram_users": authorized_users}}
-        )
+        db = get_db()
+        await db.config.update_one({"id": config['id']}, {"$set": {"authorized_telegram_users": authorized_users}})
         await send_telegram_message(chat_id, f"✅ User {target_chat_id} has been authorized.")
         await send_telegram_message(target_chat_id, "✅ You have been authorized to use GhostMail bot!")
     else:
         await send_telegram_message(chat_id, f"ℹ️ User {target_chat_id} is already authorized.")
 
 async def handle_myid_command(chat_id: int, username: str):
-    """Handle /myid command"""
-    message = f"""🆔 <b>YOUR IDENTITY</b>
+    await send_telegram_message(chat_id, f"""🆔 <b>YOUR IDENTITY</b>
 
 <b>Chat ID:</b> <code>{chat_id}</code>
 <b>Username:</b> @{username if username else 'not set'}
 
 <b>Website Login:</b>
-Use your username <code>@{username}</code> to login on the website.
-An OTP will be sent here for verification."""
-    
-    await send_telegram_message(chat_id, message)
+Use your username <code>@{username}</code> to login on the website.""")
 
 async def handle_generate_command(chat_id: int, text: str):
-    """Handle /generate command"""
     parts = text.split(maxsplit=1)
     custom_prefix = parts[1] if len(parts) > 1 else None
     
@@ -981,55 +789,40 @@ async def handle_generate_command(chat_id: int, text: str):
     domain = await get_default_domain()
     email_address = f"{prefix}@{domain}"
     
+    db = get_db()
     existing = await db.temp_emails.find_one({"email_address": email_address, "is_active": True}, {"_id": 0})
     if existing:
         await send_telegram_message(chat_id, "❌ Email already exists. Try a different prefix.")
         return
     
     expires_at = None
-    expiration_hours = config.get('default_expiration_hours')
-    if expiration_hours:
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=expiration_hours)
+    if config.get('default_expiration_hours'):
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=config['default_expiration_hours'])
     
-    temp_email = TempEmail(
-        email_address=email_address,
-        expires_at=expires_at,
-        telegram_chat_id=chat_id
-    )
-    
+    temp_email = TempEmail(email_address=email_address, expires_at=expires_at, telegram_chat_id=chat_id)
     email_dict = temp_email.model_dump()
     email_dict['created_at'] = email_dict['created_at'].isoformat()
     email_dict['expires_at'] = email_dict['expires_at'].isoformat() if email_dict['expires_at'] else None
     
-    insert_doc = email_dict.copy()
-    await db.temp_emails.insert_one(insert_doc)
-    
-    await db.telegram_users.update_one(
-        {"chat_id": chat_id},
-        {"$set": {"current_email_id": email_dict['id']}}
-    )
+    await db.temp_emails.insert_one(email_dict.copy())
+    await db.telegram_users.update_one({"chat_id": chat_id}, {"$set": {"current_email_id": email_dict['id']}})
     
     expiry_text = f"\n⏰ Expires: {expires_at.strftime('%Y-%m-%d %H:%M UTC')}" if expires_at else "\n⏰ No expiration"
     
-    message = f"""✅ <b>EMAIL GENERATED</b>
+    await send_telegram_message(chat_id, f"""✅ <b>EMAIL GENERATED</b>
 
 📧 <code>{email_address}</code>
 
 ID: <code>{email_dict['id'][:8]}...</code>{expiry_text}
 
-<i>All emails will be forwarded to this chat!</i>"""
-    
-    await send_telegram_message(chat_id, message)
+<i>All emails will be forwarded here!</i>""")
 
 async def handle_inbox_command(chat_id: int):
-    """Handle /inbox command"""
+    db = get_db()
     user = await db.telegram_users.find_one({"chat_id": chat_id}, {"_id": 0})
     
     if not user or not user.get('current_email_id'):
-        temp_email = await db.temp_emails.find_one(
-            {"telegram_chat_id": chat_id, "is_active": True},
-            {"_id": 0}
-        )
+        temp_email = await db.temp_emails.find_one({"telegram_chat_id": chat_id, "is_active": True}, {"_id": 0})
         if not temp_email:
             await send_telegram_message(chat_id, "❌ No active email. Use /generate to create one.")
             return
@@ -1042,89 +835,53 @@ async def handle_inbox_command(chat_id: int):
         await send_telegram_message(chat_id, "❌ Email not found.")
         return
     
-    emails = await db.inbox.find(
-        {"temp_email_id": email_id},
-        {"_id": 0}
-    ).sort("received_at", -1).to_list(10)
+    emails = await db.inbox.find({"temp_email_id": email_id}, {"_id": 0}).sort("received_at", -1).to_list(10)
     
     if not emails:
-        message = f"""📭 <b>INBOX EMPTY</b>
-
-📧 {temp_email['email_address']}
-
-No emails received yet."""
+        message = f"📭 <b>INBOX EMPTY</b>\n\n📧 {temp_email['email_address']}\n\nNo emails received yet."
     else:
-        message = f"""📬 <b>INBOX</b> ({len(emails)} messages)
-
-📧 {temp_email['email_address']}
-
-"""
+        message = f"📬 <b>INBOX</b> ({len(emails)} messages)\n\n📧 {temp_email['email_address']}\n\n"
         for i, email in enumerate(emails, 1):
             read_status = "📖" if email.get('is_read') else "📩"
-            message += f"""{read_status} <b>{i}.</b> {email['subject'][:30]}...
-   From: {email['from_address'][:25]}...
-   
-"""
+            message += f"{read_status} <b>{i}.</b> {email['subject'][:30]}...\n   From: {email['from_address'][:25]}...\n\n"
     
     await send_telegram_message(chat_id, message)
 
 async def handle_list_command(chat_id: int):
-    """Handle /list command"""
-    emails = await db.temp_emails.find(
-        {"telegram_chat_id": chat_id, "is_active": True},
-        {"_id": 0}
-    ).to_list(20)
+    db = get_db()
+    emails = await db.temp_emails.find({"telegram_chat_id": chat_id, "is_active": True}, {"_id": 0}).to_list(20)
     
     if not emails:
         await send_telegram_message(chat_id, "❌ No active emails. Use /generate to create one.")
         return
     
-    message = f"""📋 <b>YOUR ACTIVE EMAILS</b> ({len(emails)})
-
-"""
+    message = f"📋 <b>YOUR ACTIVE EMAILS</b> ({len(emails)})\n\n"
     for i, email in enumerate(emails, 1):
         inbox_count = await db.inbox.count_documents({"temp_email_id": email['id']})
-        message += f"""<b>{i}.</b> <code>{email['email_address']}</code>
-   ID: <code>{email['id'][:8]}</code> | 📬 {inbox_count} emails
-
-"""
+        message += f"<b>{i}.</b> <code>{email['email_address']}</code>\n   ID: <code>{email['id'][:8]}</code> | 📬 {inbox_count} emails\n\n"
     
     message += "\n<i>Use /delete [id] to remove an email</i>"
     await send_telegram_message(chat_id, message)
 
 async def handle_delete_command(chat_id: int, text: str):
-    """Handle /delete command"""
     parts = text.split(maxsplit=1)
     if len(parts) < 2:
         await send_telegram_message(chat_id, "❌ Usage: /delete [email_id]\n\nUse /list to see your emails.")
         return
     
     email_id_prefix = parts[1].strip()
-    
-    email = await db.temp_emails.find_one(
-        {
-            "telegram_chat_id": chat_id,
-            "is_active": True,
-            "id": {"$regex": f"^{email_id_prefix}"}
-        },
-        {"_id": 0}
-    )
+    db = get_db()
+    email = await db.temp_emails.find_one({"telegram_chat_id": chat_id, "is_active": True, "id": {"$regex": f"^{email_id_prefix}"}}, {"_id": 0})
     
     if not email:
         await send_telegram_message(chat_id, "❌ Email not found. Check the ID with /list")
         return
     
-    await db.temp_emails.update_one(
-        {"id": email['id']},
-        {"$set": {"is_active": False}}
-    )
-    
+    await db.temp_emails.update_one({"id": email['id']}, {"$set": {"is_active": False}})
     await send_telegram_message(chat_id, f"✅ Deleted: {email['email_address']}")
 
 async def handle_send_command(chat_id: int, text: str):
-    """Handle /send command"""
     parts = text.split('|')
-    
     if len(parts) < 3:
         await send_telegram_message(chat_id, """📤 <b>SEND EMAIL</b>
 
@@ -1138,12 +895,10 @@ Example:
     subject = parts[1].strip()
     body = parts[2].strip()
     
+    db = get_db()
     user = await db.telegram_users.find_one({"chat_id": chat_id}, {"_id": 0})
     if not user or not user.get('current_email_id'):
-        temp_email = await db.temp_emails.find_one(
-            {"telegram_chat_id": chat_id, "is_active": True},
-            {"_id": 0}
-        )
+        temp_email = await db.temp_emails.find_one({"telegram_chat_id": chat_id, "is_active": True}, {"_id": 0})
         if not temp_email:
             await send_telegram_message(chat_id, "❌ No active email. Use /generate first.")
             return
@@ -1164,27 +919,13 @@ Example:
     resend.api_key = config['resend_api_key']
     
     try:
-        params = {
-            "from": temp_email['email_address'],
-            "to": [to_email],
-            "subject": subject,
-            "html": f"<p>{body}</p>"
-        }
-        
-        await asyncio.to_thread(resend.Emails.send, params)
-        
-        await send_telegram_message(chat_id, f"""✅ <b>EMAIL SENT</b>
-
-From: {temp_email['email_address']}
-To: {to_email}
-Subject: {subject}""")
+        await asyncio.to_thread(resend.Emails.send, {"from": temp_email['email_address'], "to": [to_email], "subject": subject, "html": f"<p>{body}</p>"})
+        await send_telegram_message(chat_id, f"✅ <b>EMAIL SENT</b>\n\nFrom: {temp_email['email_address']}\nTo: {to_email}\nSubject: {subject}")
     except Exception as e:
-        logger.error(f"Failed to send email: {e}")
         await send_telegram_message(chat_id, f"❌ Failed to send: {str(e)}")
 
 async def handle_help_command(chat_id: int):
-    """Handle /help command"""
-    help_message = """🔮 <b>GHOSTMAIL COMMANDS</b>
+    await send_telegram_message(chat_id, """🔮 <b>GHOSTMAIL COMMANDS</b>
 
 <b>📧 Email Management:</b>
 /generate [prefix] - Create temp email
@@ -1202,29 +943,17 @@ async def handle_help_command(chat_id: int):
 <b>ℹ️ Info:</b>
 /help - Show this message
 
-<b>📌 Tips:</b>
-• All received emails are auto-forwarded here
-• Attachments are sent as documents
-• Use custom prefix for memorable addresses
-• Use /myid to get login credentials for website
-
-🛡️ <i>Stay anonymous. Stay safe.</i>"""
-    
-    await send_telegram_message(chat_id, help_message)
+🛡️ <i>Stay anonymous. Stay safe.</i>""")
 
 # ==================== STATS ENDPOINT ====================
 
 @api_router.get("/stats")
 async def get_stats(session = Depends(verify_user_session)):
-    """Get system statistics"""
-    total_emails = await db.temp_emails.count_documents({"is_active": True})
-    total_messages = await db.inbox.count_documents({})
-    total_users = await db.telegram_users.count_documents({})
-    
+    db = get_db()
     return {
-        "active_emails": total_emails,
-        "total_messages": total_messages,
-        "telegram_users": total_users
+        "active_emails": await db.temp_emails.count_documents({"is_active": True}),
+        "total_messages": await db.inbox.count_documents({}),
+        "telegram_users": await db.telegram_users.count_documents({})
     }
 
 # ==================== ROOT ENDPOINT ====================
@@ -1233,9 +962,10 @@ async def get_stats(session = Depends(verify_user_session)):
 async def root():
     return {"message": "GhostMail API v1.0", "status": "online"}
 
-# Include the router in the main app
+# Include the router
 app.include_router(api_router)
 
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -1244,6 +974,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Shutdown handler
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    global _client
+    if _client:
+        _client.close()
