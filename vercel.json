@@ -19,6 +19,10 @@
       "destination": "/backend/server.py"
     },
     {
+      "source": "/:path([^.]*)",
+      "destination": "/frontend/index.html"
+    },
+    {
       "source": "/:path*",
       "destination": "/frontend/:path*"
     }
