@@ -13,16 +13,17 @@
       }
     }
   ],
-  "routes": [
+  "rewrites": [
     {
-      "src": "/api/(.*)",
-      "dest": "backend/server.py"
+      "source": "/api/:path*",
+      "destination": "/backend/server.py"
     },
     {
-      "src": "/(.*)",
-      "dest": "frontend/$1"
+      "source": "/:path*",
+      "destination": "/frontend/:path*"
     }
   ],
+  "cleanUrls": true,
   "env": {
     "PYTHONUNBUFFERED": "1"
   }
