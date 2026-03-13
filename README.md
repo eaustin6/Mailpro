@@ -14,6 +14,8 @@ Generate disposable email addresses with full Telegram bot integration.
 
 ## 🚀 Vercel Deployment Guide
 
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fyourusername%2Fghostmail&env=MONGO_URL,ADMIN_PASSWORD&envDescription=MongoDB%20Connection%20String%20and%20Admin%20Panel%20Password)
+
 ### Step 1: Fork or Clone Repository
 
 ```bash
